@@ -1,0 +1,31 @@
+name: Build Android
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: 解开源码压缩包
+        run: |
+          for f in *.tar.gz; do
+            [ -f "$f" ] || continue
+            tar -xzf "$f"
+          done
+          ls -a
+      - name: 编译
+        run: |
+          cd android
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          gradle assembleDebug --stacktrace --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guzhenren-apk
+          path: android/app/build/outputs/apk/**/*.apk
