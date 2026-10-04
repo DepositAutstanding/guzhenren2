@@ -1,0 +1,165 @@
+# ============================================================================
+#  只编译 libguzhenren.so（不打 APK）
+#
+#  设计要点（都是踩过坑后的调整）：
+#
+#   1. 【不依赖任何第三方 action】
+#      改用 curl 直接从 Google 官方下载 NDK。
+#      第三方 action（setup-ndk / setup-android / sdkmanager）在 runner
+#      镜像变动时会失效，且失败信息很难读。直连下载唯一、可预期。
+#
+#   2. 【失败也一定留日志】
+#      加了 if: always() 的日志上传步骤。
+#      之前只靠「把日志复制给我」是行不通的 —— 日志动辄几百行，
+#      翻找成本高。现在无论成功失败，日志都会作为 artifact 存下来。
+#
+#   3. 【每一步都自证】
+#      下载完 NDK 立刻校验 toolchain 与 native_app_glue 是否真的存在，
+#      不在就当场报错，而不是等到配置阶段才失败。
+#
+#  产物：guzhenren-so（arm64-v8a 的 libguzhenren.so）
+# ============================================================================
+name: Build Native Lib
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-so:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      #  ---------- 准备：解开网页上传版的分卷 ----------
+      - name: 解开源码压缩包
+        run: |
+          for f in *.tar.gz; do
+            [ -f "$f" ] || continue
+            echo "解开: $f"
+            tar -xzf "$f"
+          done
+          echo "--- 顶层结构 ---"
+          ls -a
+          echo "--- 关键文件自查 ---"
+          for p in android/app/src/main/cpp/CMakeLists.txt \
+                   android/app/src/main/cpp/android_main.cpp \
+                   src/ui/AndroidViewport.cpp \
+                   include/gr/ui/AndroidViewport.hpp \
+                   third_party/imgui/imgui.cpp ; do
+            if [ -f "$p" ]; then echo "  OK   $p"; else echo "  !!缺失 $p"; fi
+          done
+          echo "--- 工程根顶层 ---"
+          ls -a
+          echo "--- 三个标记目录是否存在于工程根 ---"
+          for d in src include third_party; do
+            if [ -d "$d" ]; then echo "  OK   $d/"; else echo "  !!缺 $d/"; fi
+          done
+          echo "--- 若 src/ 不在根，实际在哪 ---"
+          find . -maxdepth 4 -type d -name src 2>/dev/null | head -10
+          echo "--- src/ 下的子目录 ---"
+          ls src/ 2>/dev/null || echo "  !! src/ 不存在（core-src.tar.gz 可能未上传或未解开）"
+          echo "--- 各子目录 .cpp 数量 ---"
+          for d in ai battle core cultivator gu net sim ui world; do
+            n=$(ls src/$d/*.cpp 2>/dev/null | wc -l)
+            echo "  src/$d: $n"
+          done
+          echo "--- 合计 ---"
+          find src -name '*.cpp' 2>/dev/null | wc -l
+
+      #  ---------- NDK：直连下载，不用第三方 action ----------
+      - name: 下载 NDK r27c
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          echo "=== 开始下载 NDK ==="
+          curl -sSL --retry 3 --retry-delay 5 \
+            -o ndk.zip \
+            "https://dl.google.com/android/repository/android-ndk-r27c-linux.zip"
+          echo "下载完成，大小: $(stat -c%s ndk.zip) 字节"
+          unzip -q ndk.zip
+          NDK="$GITHUB_WORKSPACE/android-ndk-r27c"
+          echo "NDK_PATH=$NDK" >> $GITHUB_ENV
+          echo "=== NDK 目录 ==="
+          ls "$NDK"
+
+      - name: 校验 NDK 关键文件
+        run: |
+          NDK="$NDK_PATH"
+          echo "NDK_PATH=$NDK"
+          echo "=== toolchain ==="
+          ls -la "$NDK/build/cmake/android.toolchain.cmake" || echo "!! 缺 toolchain"
+          echo "=== native_app_glue ==="
+          ls -la "$NDK/sources/android/native_app_glue/" || echo "!! 缺 native_app_glue"
+          echo "=== clang ==="
+          ls "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/" | head -5
+          #  用 find 实际定位 native_app_glue —— 不同 NDK 版本路径可能不同，
+          #  找到就把目录写进 GITHUB_ENV，供 CMake 用 -DGLUE_PATH 接收。
+          G=$(find "$NDK" -name 'android_native_app_glue.c' -print -quit 2>/dev/null)
+          if [ -n "$G" ]; then
+            echo "GLUE_PATH=$(dirname "$G")" >> $GITHUB_ENV
+            echo "定位到 glue: $G"
+          else
+            echo "::warning::NDK 内未找到 android_native_app_glue.c"
+          fi
+
+      #  ---------- 配置 ----------
+      - name: 配置 CMake
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          #  不设 CMAKE_BUILD_TYPE：默认无优化，编译最快、最省内存。
+          #  runner 只有 2 核，带 -O3 编 40+ 文件（含 140KB 的 GuData.cpp）
+          #  既慢又容易吃满内存。
+          cmake -S android/app/src/main/cpp -B build \
+            -DGZR_ROOT="$GITHUB_WORKSPACE" \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_NDK="$NDK_PATH" \
+            -DGLUE_PATH="$GLUE_PATH" \
+            --no-warn-unused-cli 2>&1 | tee cmake-config.log
+          echo "=== 配置退出码: ${PIPESTATUS[0]} ==="
+          #  失败时把 CMake 的错误行直接打到摘要里 ——
+          #  否则要翻几百行日志才知道原因。
+          if [ -f cmake-config.log ]; then
+            echo "########## CMake 错误行 ##########"
+            grep -nE "CMake Error|CMake Warning|Could NOT find|FATAL_ERROR|No SOURCES|Error:" cmake-config.log | head -40
+            echo "##################################"
+          fi
+
+      #  ---------- 编译 ----------
+      - name: 编译
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          cmake --build build -j2 --verbose 2>&1 | tail -300 | tee build.log
+          echo "=== 编译退出码: ${PIPESTATUS[0]} ==="
+
+      #  ---------- 收集 ----------
+      - name: 收集 .so
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p out
+          find build -name 'libguzhenren.so' -exec cp -v {} out/ \;
+          ls -la out/
+
+      #  ---------- 日志：无论成败都存 ----------
+      - name: 上传日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            cmake-config.log
+            build.log
+          if-no-files-found: warn
+
+      - name: 上传 .so
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guzhenren-so
+          path: out/libguzhenren.so
+          if-no-files-found: error
+
